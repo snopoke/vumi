@@ -95,7 +95,7 @@ border-radius: 			5px;
 }
 /* HEADER */	
 #header {
-	width: 				auto;
+	width: 				920px;
 	margin:				12px 0 0 0;
 	height:				88px
 }
@@ -272,7 +272,7 @@ form#forgot-form span {
 	-moz-border-radius:					5px;	
 	border-radius:						5px;
 	padding:			10px;
-	font-size:			0.9em;
+	font-size:			0.9em;;
 	color:				#000
 }
 #signup-box input.txtbox:focus {
@@ -302,20 +302,23 @@ input.error {
 #signup-label-co {
 	top:				103px;
 }
-#signup-input-co {
+#signup-input-co,
+#company {
 	top:				88px;
 }
 #signup-label-name {
-	top:				123px;
+	top:				146px;
 }
-#signup-input-name {
-	top:				108px;
+#signup-input-name,
+.signup-input-name {
+	top:				131px;
 }
 #signup-label-email {
-	top:				166px;
+	top:				189px;
 }
-#signup-input-email {
-	top:				151px;
+#signup-input-email,
+.signup-input-email {
+	top:				174px;
 }
 #signup-box input.btn {
 	background-color:	#f26568;
@@ -327,7 +330,7 @@ input.error {
 	-moz-border-radius:					5px;	
 	border-radius:						5px;
 	position:			absolute;
-	top:				205px;
+	top:				235px;
 	left:				690px
 	}
 	
@@ -475,6 +478,12 @@ form#set-new-password input.btn {
 	font-size:			0.8em;
 	display:			block	
 }
+
+#header #dl_link {
+	margin-top: 0;
+	padding:    12px 17px 12px 50px;
+	background:			#f26568 url(../pics/ui/sprite-map.png) -149px -20px no-repeat;
+}
 .os p { 
 	width:				650px
 }
@@ -512,12 +521,18 @@ p.intro {
 }
 
 .contact {
-	float:				right;
-	width:				160px;
-	margin-left:		20px
+	float:				left;
+	width:				180px;
+	padding:			15px;
+	margin-right:		20px;
+	background-color: 	#fff;
+	-webkit-border-radius: 	10px;
+	-moz-border-radius: 	10px;
+	border-radius: 			10px;
 }
 .contact h3 { 
-	margin-top:			0;
+	margin:			0 0 0 0;
+	padding:		0;
 	font-variant:		normal
 }
 .contact-narrow {
