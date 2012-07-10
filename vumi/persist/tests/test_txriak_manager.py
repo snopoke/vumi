@@ -133,6 +133,12 @@ class CommonRiakManagerTests(object):
         result = yield self.manager.load(DummyModel, dummy.key)
         self.assertEqual(result, None)
 
+    @Manager.calls_manager
+    def test_enable_search(self):
+        self.assertFalse((yield self.manager.riak_search_enabled(DummyModel)))
+        self.assertTrue((yield self.manager.riak_enable_search(DummyModel)))
+        self.assertTrue((yield self.manager.riak_search_enabled(DummyModel)))
+
 
 class TestTxRiakManager(CommonRiakManagerTests, TestCase):
     @inlineCallbacks

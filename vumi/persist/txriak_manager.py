@@ -82,6 +82,11 @@ class TxRiakManager(Manager):
         bucket = self.client.bucket(bucket_name)
         return bucket.enable_search()
 
+    def riak_search_enabled(self, cls):
+        bucket_name = self.bucket_name(cls)
+        bucket = self.client.bucket(bucket_name)
+        return bucket.search_enabled()
+
     def run_map_reduce(self, mapreduce, mapper_func):
         mapreduce_done = mapreduce.run()
 
@@ -103,4 +108,36 @@ class TxRiakManager(Manager):
             if bucket_name.startswith(self.bucket_prefix):
                 bucket = self.client.bucket(bucket_name)
                 deferreds.append(bucket.purge_keys())
+                deferreds.append(delete_bucket_properties(bucket))
         yield gatherResults(deferreds)
+
+
+@inlineCallbacks
+def delete_bucket_properties(bucket):
+    """Delete bucket properties.
+
+    NOTE: This uses a feature that isn't actually in Riak yet.
+    """
+    from twisted.internet.defer import returnValue
+    from txriak import util
+
+    host, port, url = util.build_rest_path(bucket._client, bucket)
+
+    #Run the request...
+    response = yield util.http_request_deferred(
+        'DELETE', host, port, url)
+
+    # Handle the response...
+    if (response == None):
+        raise Exception('Error clearing bucket properties.')
+
+    # Check the response value...
+    status = response[0]['http_code']
+
+    if (status != 204):
+        if status == 405:
+            # The server doesn't support this.
+            pass
+        else:
+            raise Exception('Error clearing bucket properties.')
+    returnValue(response)

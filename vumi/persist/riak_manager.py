@@ -122,6 +122,11 @@ class RiakManager(Manager):
         bucket = self.client.bucket(bucket_name)
         return bucket.enable_search()
 
+    def riak_search_enabled(self, cls):
+        bucket_name = self.bucket_name(cls)
+        bucket = self.client.bucket(bucket_name)
+        return bucket.search_enabled()
+
     def purge_all(self):
         buckets = self.client.get_buckets()
         for bucket_name in buckets:
@@ -130,3 +135,32 @@ class RiakManager(Manager):
                 for key in bucket.get_keys():
                     obj = bucket.get(key)
                     obj.delete()
+                delete_bucket_properties(bucket)
+
+
+def delete_bucket_properties(bucket):
+    """Delete bucket properties.
+
+    NOTE: This uses a feature that isn't actually in Riak yet.
+    """
+
+    t = bucket._client.get_transport()
+
+    url = t.build_rest_path(bucket)
+
+    # Run the request...
+    response = t.http_request('DELETE', url)
+
+    # Handle the response...
+    if response is None:
+        raise Exception('Error clearing bucket properties.')
+
+    # Check the response value...
+    status = response[0]['http_code']
+    if status != 204:
+        if status == 405:
+            # The server doesn't support this.
+            pass
+        else:
+            raise Exception('Error clearing bucket properties.')
+    return True
