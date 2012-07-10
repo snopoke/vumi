@@ -119,7 +119,7 @@ def delete_bucket_properties(bucket):
     NOTE: This uses a feature that isn't actually in Riak yet.
     """
     from twisted.internet.defer import returnValue
-    from txriak import util
+    from riakasaurus import util
 
     host, port, url = util.build_rest_path(bucket._client, bucket)
 
