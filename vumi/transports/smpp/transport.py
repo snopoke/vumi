@@ -2,19 +2,19 @@
 
 from datetime import datetime
 
-import redis
-from twisted.python import log
 from twisted.internet import reactor
+from twisted.internet.defer import inlineCallbacks, returnValue
 
+from vumi import log
 from vumi.utils import get_operator_number
 from vumi.transports.base import Transport
-from vumi.transports.smpp.clientserver.client import (EsmeTransceiverFactory,
-                                                      EsmeTransmitterFactory,
-                                                      EsmeReceiverFactory,
-                                                      EsmeCallbacks)
+from vumi.transports.smpp.clientserver.client import (
+    EsmeTransceiverFactory, EsmeTransmitterFactory, EsmeReceiverFactory,
+    EsmeCallbacks)
 from vumi.transports.smpp.clientserver.config import ClientConfig
 from vumi.transports.failures import FailureMessage
-from vumi.message import Message
+from vumi.message import Message, TransportUserMessage
+from vumi.persist.txredis_manager import TxRedisManager
 
 
 class SmppTransport(Transport):
@@ -82,6 +82,19 @@ class SmppTransport(Transport):
         Whether to ask for delivery reports. Default 1 (request delivery
         reports).
 
+    :param dict data_coding_overrides:
+        Overrides for data_coding character set mapping. This is useful for
+        setting the default encoding (0), adding additional undefined encodings
+        (such as 4 or 8) or overriding encodings in cases where the SMSC is
+        violating the spec (which happens a lot). Keys should be integers,
+        values should be strings containing valid Python character encoding
+        names.
+
+    :param bool send_long_messages:
+        If `True`, messages longer than 254 characters will be sent in the
+        `message_payload` optional field instead of the `short_message` field.
+        Default is `False`, simply because that maintains previous behaviour.
+
     The list of SMPP protocol configuration options given above is not
     exhaustive. Any other options specified are passed through to the
     python-smpp library PDU (protocol data unit) builder.
@@ -111,6 +124,7 @@ class SmppTransport(Transport):
     def validate_config(self):
         self.client_config = ClientConfig.from_config(self.config)
 
+    @inlineCallbacks
     def setup_transport(self):
         log.msg("Starting the SmppTransport with %s" % self.config)
 
@@ -119,21 +133,17 @@ class SmppTransport(Transport):
                 60 * 60 * 24 * 7  # 1 week
                 )
 
-        # Connect to Redis
-        if not hasattr(self, 'r_server'):
-            # Only set up redis if we don't have a test stub already
-            self.r_server = redis.Redis(**self.config.get('redis', {}))
-
+        r_config = self.config.get('redis_manager', {})
         default_prefix = "%s@%s:%s" % (
                 self.client_config.system_id,
                 self.client_config.host,
                 self.client_config.port,
                 )
+        r_prefix = self.config.get('split_bind_prefix', default_prefix)
+        redis = yield TxRedisManager.from_config(r_config)
+        self.redis = redis.sub_manager(r_prefix)
 
-        self.r_prefix = self.config.get('split_bind_prefix', default_prefix)
-
-        self.r_message_prefix = "%s#message_json" % self.r_prefix
-        log.msg("Connected to Redis, prefix: %s" % self.r_prefix)
+        self.r_message_prefix = "message_json"
 
         self.esme_callbacks = EsmeCallbacks(
             connect=self.esme_connected,
@@ -150,10 +160,16 @@ class SmppTransport(Transport):
                 self.client_config.port,
                 self.factory)
 
+    @inlineCallbacks
+    def teardown_transport(self):
+        if hasattr(self, 'factory'):
+            self.factory.stopTrying()
+            self.factory.esme.transport.loseConnection()
+        yield self.redis._close()
+
     def make_factory(self):
-        return EsmeTransceiverFactory(self.client_config,
-                                        self.r_server,
-                                        self.esme_callbacks)
+        return EsmeTransceiverFactory(
+            self.client_config, self.redis, self.esme_callbacks)
 
     def esme_connected(self, client):
         log.msg("ESME Connected, adding handlers")
@@ -161,14 +177,15 @@ class SmppTransport(Transport):
         # Start the consumer
         return self._setup_message_consumer()
 
+    @inlineCallbacks
     def handle_outbound_message(self, message):
-        log.msg("Consumed outgoing message", message)
-        log.msg("Unacknowledged message count: %s" % (
-            self.esme_client.get_unacked_count()))
-        self.r_set_message(message)
-        sequence_number = self.send_smpp(message)
-        self.r_set_id_for_sequence(sequence_number,
-                                   message.payload.get("message_id"))
+        log.debug("Consumed outgoing message", message)
+        log.debug("Unacknowledged message count: %s" % (
+                (yield self.esme_client.get_unacked_count()),))
+        yield self.r_set_message(message)
+        sequence_number = yield self.send_smpp(message)
+        yield self.r_set_id_for_sequence(
+            sequence_number, message.payload.get("message_id"))
 
     def esme_disconnected(self):
         log.msg("ESME Disconnected")
@@ -181,86 +198,91 @@ class SmppTransport(Transport):
 
     def r_set_message(self, message):
         message_id = message.payload['message_id']
-        self.r_server.set(self.r_message_key(message_id), message.to_json())
+        return self.redis.set(
+            self.r_message_key(message_id), message.to_json())
 
     def r_get_message_json(self, message_id):
-        return self.r_server.get(self.r_message_key(message_id))
+        return self.redis.get(self.r_message_key(message_id))
 
+    @inlineCallbacks
     def r_get_message(self, message_id):
-        json_string = self.r_get_message_json(message_id)
+        json_string = yield self.r_get_message_json(message_id)
         if json_string:
-            return Message.from_json(json_string)
+            returnValue(Message.from_json(json_string))
         else:
-            return None
+            returnValue(None)
 
     def r_delete_message(self, message_id):
-        return self.r_server.delete(self.r_message_key(message_id))
+        return self.redis.delete(self.r_message_key(message_id))
 
     # Redis sequence number storing methods
 
-    def r_sequence_number_key(self, sequence_number):
-        return "%s#%s" % (self.r_prefix, sequence_number)
-
     def r_get_id_for_sequence(self, sequence_number):
-        return self.r_server.get(self.r_sequence_number_key(sequence_number))
+        return self.redis.get(str(sequence_number))
 
     def r_delete_for_sequence(self, sequence_number):
-        return self.r_server.delete(
-                self.r_sequence_number_key(sequence_number))
+        return self.redis.delete(str(sequence_number))
 
     def r_set_id_for_sequence(self, sequence_number, id):
-        self.r_server.set(self.r_sequence_number_key(sequence_number), id)
+        return self.redis.set(str(sequence_number), id)
 
     # Redis 3rd party id to vumi id mapping
 
     def r_third_party_id_key(self, third_party_id):
-        return "%s#3rd_party_id#%s" % (self.r_prefix, third_party_id)
+        return "3rd_party_id#%s" % (third_party_id,)
 
     def r_get_id_for_third_party_id(self, third_party_id):
-        return self.r_server.get(self.r_third_party_id_key(third_party_id))
+        return self.redis.get(self.r_third_party_id_key(third_party_id))
 
     def r_delete_for_third_party_id(self, third_party_id):
-        return self.r_server.delete(
+        return self.redis.delete(
                 self.r_third_party_id_key(third_party_id))
 
+    @inlineCallbacks
     def r_set_id_for_third_party_id(self, third_party_id, id):
         rkey = self.r_third_party_id_key(third_party_id)
-        self.r_server.set(rkey, id)
-        self.r_server.expire(rkey, self.third_party_id_expiry)
+        yield self.redis.set(rkey, id)
+        yield self.redis.expire(rkey, self.third_party_id_expiry)
 
+    @inlineCallbacks
     def submit_sm_resp(self, *args, **kwargs):
         transport_msg_id = kwargs['message_id']
-        sent_sms_id = self.r_get_id_for_sequence(kwargs['sequence_number'])
+        sent_sms_id = (
+            yield self.r_get_id_for_sequence(kwargs['sequence_number']))
         if sent_sms_id is None:
             log.err("Sequence number lookup failed for:%s" % (
-                kwargs['sequence_number']))
+                kwargs['sequence_number'],))
         else:
-            self.r_set_id_for_third_party_id(transport_msg_id, sent_sms_id)
-            self.r_delete_for_sequence(kwargs['sequence_number'])
+            yield self.r_set_id_for_third_party_id(
+                transport_msg_id, sent_sms_id)
+            yield self.r_delete_for_sequence(kwargs['sequence_number'])
             if kwargs['command_status'] == 'ESME_ROK':
                 # The sms was submitted ok
-                self.submit_sm_success(sent_sms_id, transport_msg_id)
+                yield self.submit_sm_success(sent_sms_id, transport_msg_id)
             else:
                 # We have an error
-                self.submit_sm_failure(sent_sms_id, kwargs['command_status'])
+                yield self.submit_sm_failure(
+                    sent_sms_id, kwargs['command_status'])
 
+    @inlineCallbacks
     def submit_sm_success(self, sent_sms_id, transport_msg_id):
-        self.r_delete_message(sent_sms_id)
-        log.msg("Mapping transport_msg_id=%s to sent_sms_id=%s" % (
+        yield self.r_delete_message(sent_sms_id)
+        log.debug("Mapping transport_msg_id=%s to sent_sms_id=%s" % (
             transport_msg_id, sent_sms_id))
-        log.msg("PUBLISHING ACK: (%s -> %s)" % (
+        log.debug("PUBLISHING ACK: (%s -> %s)" % (
             sent_sms_id, transport_msg_id))
         self.publish_ack(
             user_message_id=sent_sms_id,
             sent_message_id=transport_msg_id)
 
+    @inlineCallbacks
     def submit_sm_failure(self, sent_sms_id, reason, failure_code=None):
-        error_message = self.r_get_message(sent_sms_id)
+        error_message = yield self.r_get_message(sent_sms_id)
         if error_message is None:
             log.err("Could not retrieve failed message:%s" % (
                 sent_sms_id))
         else:
-            self.r_delete_message(sent_sms_id)
+            yield self.r_delete_message(sent_sms_id)
             self.failure_publisher.publish_message(FailureMessage(
                     message=error_message.payload,
                     failure_code=None,
@@ -278,6 +300,7 @@ class SmppTransport(Transport):
             return "failed"
         return "pending"
 
+    @inlineCallbacks
     def delivery_report(self, *args, **kwargs):
         transport_metadata = {
                 "message": kwargs['delivery_report'],
@@ -286,51 +309,66 @@ class SmppTransport(Transport):
                 }
         delivery_status = self.delivery_status(
             kwargs['delivery_report']['stat'])
-        message_id = self.r_get_id_for_third_party_id(
-                                        kwargs['delivery_report']['id'])
+        message_id = yield self.r_get_id_for_third_party_id(
+            kwargs['delivery_report']['id'])
         log.msg("PUBLISHING DELIV REPORT: %s %s" % (message_id,
                                                     delivery_status))
-        return self.publish_delivery_report(
-            user_message_id=message_id,
-            delivery_status=delivery_status,
-            transport_metadata=transport_metadata)
+        returnValue((yield self.publish_delivery_report(
+                    user_message_id=message_id,
+                    delivery_status=delivery_status,
+                    transport_metadata=transport_metadata)))
 
     def deliver_sm(self, *args, **kwargs):
-        message = dict(
-                message_id=kwargs.get('message_id'),
-                to_addr=kwargs.get('destination_addr'),
-                from_addr=kwargs.get('source_addr'),
-                transport_type='sms',
-                content=kwargs.get('short_message'))
+        message_type = kwargs.get('message_type', 'sms')
+        message = {
+            'message_id': kwargs['message_id'],
+            'to_addr': kwargs['destination_addr'],
+            'from_addr': kwargs['source_addr'],
+            'content': kwargs['short_message'],
+            'transport_type': message_type,
+            'transport_metadata': {},
+            }
+
+        if message_type == 'ussd':
+            session_event = {
+                'new': TransportUserMessage.SESSION_NEW,
+                'continue': TransportUserMessage.SESSION_RESUME,
+                'close': TransportUserMessage.SESSION_CLOSE,
+                }[kwargs['session_event']]
+            message['session_event'] = session_event
+            session_info = kwargs.get('session_info')
+            message['transport_metadata']['session_info'] = session_info
+
         log.msg("PUBLISHING INBOUND: %s" % (message,))
         # TODO: This logs messages that fail to serialize to JSON
         #       Usually this happens when an SMPP message has content
         #       we can't decode (e.g. data_coding == 4). We should
         #       remove the try-except once we handle such messages
         #       better.
-        try:
-            return self.publish_message(**message)
-        except Exception, e:
-            log.err(e)
+        return self.publish_message(**message).addErrback(log.err)
 
     def send_smpp(self, message):
-        log.msg("Sending SMPP message: %s" % (message))
+        log.debug("Sending SMPP message: %s" % (message))
         # first do a lookup in our YAML to see if we've got a source_addr
         # defined for the given MT number, if not, trust the from_addr
         # in the message
         to_addr = message['to_addr']
         from_addr = message['from_addr']
         text = message['content']
+        continue_session = (
+            message['session_event'] != TransportUserMessage.SESSION_CLOSE)
         route = get_operator_number(to_addr,
                 self.config.get('COUNTRY_CODE', ''),
                 self.config.get('OPERATOR_PREFIX', {}),
                 self.config.get('OPERATOR_NUMBER', {})) or from_addr
-        sequence_number = self.esme_client.submit_sm(
+        return self.esme_client.submit_sm(
                 short_message=text.encode('utf-8'),
                 destination_addr=str(to_addr),
                 source_addr=route,
+                message_type=message['transport_type'],
+                continue_session=continue_session,
+                session_info=message['transport_metadata'].get('session_info'),
                 )
-        return sequence_number
 
     def stopWorker(self):
         log.msg("Stopping the SMPPTransport")
@@ -345,13 +383,11 @@ class SmppTransport(Transport):
 
 class SmppTxTransport(SmppTransport):
     def make_factory(self):
-        return EsmeTransmitterFactory(self.client_config,
-                                      self.r_server,
-                                      self.esme_callbacks)
+        return EsmeTransmitterFactory(
+            self.client_config, self.redis, self.esme_callbacks)
 
 
 class SmppRxTransport(SmppTransport):
     def make_factory(self):
-        return EsmeReceiverFactory(self.client_config,
-                                   self.r_server,
-                                   self.esme_callbacks)
+        return EsmeReceiverFactory(
+            self.client_config, self.redis, self.esme_callbacks)
