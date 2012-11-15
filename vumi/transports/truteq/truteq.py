@@ -121,7 +121,10 @@ class TruteqTransport(Transport):
         ussd_code = self.r_server.set(rkey, ussd_code)
         self.r_server.expire(rkey, self.ussd_session_lifetime)
 
-    def ussd_callback(self, msisdn, ussd_type, phase, message):
+    def ussd_callback(self, msisdn, ussd_type, phase, message, genfields=None):
+        if genfields is None:
+            genfields = {}
+        provider = genfields.get('OperatorID')
         log.msg("Received USSD, from: %s, message: %s" % (msisdn, message))
         session_event = self.SSMI_TO_VUMI_EVENT[ussd_type]
         msisdn = normalize_msisdn(msisdn)
@@ -141,6 +144,7 @@ class TruteqTransport(Transport):
 
         self.publish_message(
             from_addr=msisdn,
+            provider=provider,
             to_addr=ussd_code,
             session_event=session_event,
             content=text,
