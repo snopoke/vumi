@@ -124,7 +124,7 @@ class TruteqTransport(Transport):
     def ussd_callback(self, msisdn, ussd_type, phase, message, genfields=None):
         if genfields is None:
             genfields = {}
-        provider = genfields.get('OperatorID')
+        provider = genfields.get('OperatorID', 'unknown')
         log.msg("Received USSD, from: %s, message: %s" % (msisdn, message))
         session_event = self.SSMI_TO_VUMI_EVENT[ussd_type]
         msisdn = normalize_msisdn(msisdn)
