@@ -2,12 +2,10 @@
 
 """A manager implementation on top of txriak."""
 
-from riakasaurus.riak import RiakClient, RiakObject, RiakMapReduce, RiakLink
-import riakasaurus
+from riakasaurus.riak import RiakClient, RiakObject, RiakMapReduce
+from riakasaurus import transport
 from twisted.internet.defer import (
     inlineCallbacks, gatherResults, maybeDeferred, succeed)
-
-from distutils.version import LooseVersion
 
 from vumi.persist.model import Manager
 
@@ -21,21 +19,76 @@ class TxRiakManager(Manager):
     def from_config(cls, config):
         config = config.copy()
         bucket_prefix = config.pop('bucket_prefix')
-        client = RiakClient(**config)
-        return cls(client, bucket_prefix)
+        load_bunch_size = config.pop('load_bunch_size',
+                                     cls.DEFAULT_LOAD_BUNCH_SIZE)
+        mapreduce_timeout = config.pop('mapreduce_timeout',
+                                       cls.DEFAULT_MAPREDUCE_TIMEOUT)
+        transport_type = config.pop('transport_type', 'http')
+        transport_class = {
+            'http': transport.HTTPTransport,
+            'protocol_buffer': transport.PBCTransport,
+        }.get(transport_type, transport.HTTPTransport)
 
-    def riak_object(self, cls, key, result=None):
-        bucket_name = self.bucket_name(cls)
-        bucket = self.client.bucket(bucket_name)
+        host = config.get('host', '127.0.0.1')
+        port = config.get('port', 8098)
+        prefix = config.get('prefix', 'riak')
+        mapred_prefix = config.get('mapred_prefix', 'mapred')
+        client_id = config.get('client_id')
+        # NOTE: the current riakasaurus RiakClient doesn't accept
+        #       transport_options or solr_transport_class like the sync
+        #       RiakManager client.
+        client = RiakClient(host=host, port=port, prefix=prefix,
+            mapred_prefix=mapred_prefix, client_id=client_id,
+            transport=transport_class)
+        return cls(client, bucket_prefix, load_bunch_size=load_bunch_size,
+                   mapreduce_timeout=mapreduce_timeout)
+
+    def _encode_indexes(self, iterable, encoding='utf-8'):
+        """
+        From Basho's docs:
+
+            When using the HTTP interface, multi-valued indexes are specified
+            by separating the values with a comma (,). For that reason,
+            your application should avoid using a comma as part of an
+            index value.
+
+        The index values we get can either be a single string value or can
+        be a tuple of multiple values that need to be set. If we get a tuple
+        then convert it to a comma separated string.
+        """
+        encoded = []
+        for key, value in iterable:
+            if not isinstance(value, (list, tuple)):
+                value = [value]
+
+            value = ", ".join([v.encode(encoding) for v in value])
+            key = key.encode(encoding)
+            encoded.append((key, value))
+
+        return encoded
+
+    def riak_object(self, modelcls, key, result=None):
+        bucket = self.bucket_for_modelcls(modelcls)
         riak_object = RiakObject(self.client, bucket, key)
         if result:
             metadata = result['metadata']
-            data = result['data']
-            riak_object.set_content_type(metadata['content-type'])
-            riak_object.set_indexes(metadata['index'].items())
+            indexes = metadata['index']
+            if hasattr(indexes, 'items'):
+                # TODO: I think this is a Riak bug. In some cases
+                #       (maybe when there are no indexes?) the index
+                #       comes back as a list, in others (maybe when
+                #       there are indexes?) it comes back as a dict.
+                indexes = indexes.items()
+
+            content_type = metadata['content-type'].encode('utf-8')
+            indexes = self._encode_indexes(indexes, 'utf-8')
+            data = result['data'].encode('utf-8')
+
+            riak_object.set_content_type(content_type)
+            riak_object.set_indexes(indexes)
             riak_object.set_encoded_data(data)
         else:
-            riak_object.set_data({})
+            riak_object.set_data({'$VERSION': modelcls.VERSION})
             riak_object.set_content_type("application/json")
         return riak_object
 
@@ -47,41 +100,30 @@ class TxRiakManager(Manager):
     def delete(self, modelobj):
         return modelobj._riak_object.delete()
 
-    def load(self, cls, key, result=None):
-        riak_object = self.riak_object(cls, key, result)
-        if result:
-            return succeed(cls(self, key, _riak_object=riak_object))
-        else:
-            d = riak_object.reload()
-            d.addCallback(lambda result: cls(self, key, _riak_object=result)
-                            if result.get_data() is not None else None)
-            return d
+    def load(self, modelcls, key, result=None):
+        riak_object = self.riak_object(modelcls, key, result)
+        d = succeed(riak_object) if result else riak_object.reload()
 
-    def load_list(self, cls, keys):
-        deferreds = []
-        for key in keys:
-            deferreds.append(self.load(cls, key))
-        return gatherResults(deferreds)
+        def build_model_object(riak_object):
+            if riak_object.get_data() is None:
+                return None
+
+            data_version = riak_object.get_data().get('$VERSION', None)
+            if data_version == modelcls.VERSION:
+                return modelcls(self, key, _riak_object=riak_object)
+
+            migrator = modelcls.MIGRATOR(modelcls, self, data_version)
+            md = maybeDeferred(migrator, riak_object)
+            md.addCallback(lambda mdata: mdata.get_riak_object())
+            return md.addCallback(build_model_object)
+
+        return d.addCallback(build_model_object)
 
     def riak_map_reduce(self):
         return RiakMapReduce(self.client)
 
-    def riak_search(self, cls, query, return_keys=False):
-        bucket_name = self.bucket_name(cls)
-
-        def map_result_to_objects(result):
-            docs = result['response']['docs']
-            keys = [doc['id'] for doc in docs]
-            if return_keys:
-                return keys
-            return self.load_list(cls, keys)
-
-        d = self.client.solr().search(bucket_name, query)
-        d.addCallback(map_result_to_objects)
-        return d
-
-    def riak_enable_search(self, cls):
-        bucket_name = self.bucket_name(cls)
+    def riak_enable_search(self, modelcls):
+        bucket_name = self.bucket_name(modelcls)
         bucket = self.client.bucket(bucket_name)
         return bucket.enable_search()
 
@@ -90,24 +132,18 @@ class TxRiakManager(Manager):
         bucket = self.client.bucket(bucket_name)
         return bucket.search_enabled()
 
-    def run_map_reduce(self, mapreduce, mapper_func):
-        mapreduce_done = mapreduce.run()
-
+    def run_map_reduce(self, mapreduce, mapper_func=None, reducer_func=None):
         def map_results(raw_results):
             deferreds = []
-
-            if LooseVersion(riakasaurus.VERSION) >= LooseVersion("1.0.6"):
-                # Riakasaurus now provides links by default
-                for link in raw_results:
-                    deferreds.append(maybeDeferred(mapper_func, self, link))
-            else:
-                for row in raw_results:
-                    link = RiakLink(row[0], row[1])
-                    deferreds.append(maybeDeferred(mapper_func, self, link))
-
+            for row in raw_results:
+                deferreds.append(maybeDeferred(mapper_func, self, row))
             return gatherResults(deferreds)
 
-        mapreduce_done.addCallback(map_results)
+        mapreduce_done = mapreduce.run(timeout=self.mapreduce_timeout)
+        if mapper_func is not None:
+            mapreduce_done.addCallback(map_results)
+        if reducer_func is not None:
+            mapreduce_done.addCallback(lambda r: reducer_func(self, r))
         return mapreduce_done
 
     @inlineCallbacks

@@ -4,10 +4,11 @@ import json
 from urllib import urlencode
 
 from twisted.internet.defer import inlineCallbacks, DeferredQueue
+from twisted.web import http
 
 from vumi.utils import http_request, http_request_full
 from vumi.tests.utils import MockHttpServer
-from vumi.transports.tests.test_base import TransportTestCase
+from vumi.transports.tests.utils import TransportTestCase
 from vumi.transports.mediaedgegsm import MediaEdgeGSMTransport
 from vumi.message import TransportUserMessage
 
@@ -31,9 +32,21 @@ class TestMediaEdgeGSMTransport(TransportTestCase):
             'web_port': 0,
             'username': 'user',
             'password': 'pass',
+            'outbound_url': self.mock_mediaedgegsm.url,
+            'outbound_username': 'username',
+            'outbound_password': 'password',
+            'operator_mappings': {
+                '417': {
+                    '417912': 'VODA',
+                    '417913': 'TIGO',
+                    '417914': 'UNKNOWN',
+                }
+            }
         }
         self.transport = yield self.get_transport(self.config)
         self.transport_url = self.transport.get_transport_url()
+        self.mediaedgegsm_response = ''
+        self.mediaedgegsm_response_code = http.OK
 
     @inlineCallbacks
     def tearDown(self):
@@ -42,7 +55,8 @@ class TestMediaEdgeGSMTransport(TransportTestCase):
 
     def handle_request(self, request):
         self.mediaedgegsm_calls.put(request)
-        return ''
+        request.setResponseCode(self.mediaedgegsm_response_code)
+        return self.mediaedgegsm_response
 
     def mkurl(self, content, from_addr="2371234567", **kw):
         params = {
@@ -87,6 +101,52 @@ class TestMediaEdgeGSMTransport(TransportTestCase):
         response = yield deferred
 
         self.assertEqual(response, 'message received')
+
+    @inlineCallbacks
+    def test_outbound(self):
+        msisdns = ['+41791200000', '+41791300000', '+41791400000']
+        operators = ['VODA', 'TIGO', 'UNKNOWN']
+
+        sent_messages = []
+        for msisdn in msisdns:
+            msg = self.mkmsg_out(to_addr=msisdn)
+            yield self.dispatch(msg)
+            sent_messages.append(msg)
+
+        req1 = yield self.mediaedgegsm_calls.get()
+        req2 = yield self.mediaedgegsm_calls.get()
+        req3 = yield self.mediaedgegsm_calls.get()
+        requests = [req1, req2, req3]
+
+        for req in requests:
+            self.assertEqual(req.path, '/')
+            self.assertEqual(req.method, 'GET')
+
+        collections = zip(msisdns, operators, sent_messages, requests)
+        for msisdn, operator, msg, req in collections:
+            self.assertEqual({
+                    'USN': ['username'],
+                    'PWD': ['password'],
+                    'SmsID': [msg['message_id']],
+                    'PhoneNumber': [msisdn.lstrip('+')],
+                    'Operator': [operator],
+                    'SmsBody': [msg['content']],
+                    }, req.args)
+
+    @inlineCallbacks
+    def test_nack(self):
+        self.mediaedgegsm_response_code = http.NOT_FOUND
+        self.mediaedgegsm_response = 'Not Found'
+
+        msg = self.mkmsg_out(to_addr='+41791200000')
+        yield self.dispatch(msg)
+
+        yield self.mediaedgegsm_calls.get()
+        [nack] = yield self.wait_for_dispatched_events(1)
+        self.assertEqual(nack['user_message_id'], msg['message_id'])
+        self.assertEqual(nack['sent_message_id'], msg['message_id'])
+        self.assertEqual(nack['nack_reason'],
+            'Unexpected response code: 404')
 
     @inlineCallbacks
     def test_bad_parameter(self):

@@ -2,6 +2,7 @@
 
 import fnmatch
 from functools import wraps
+from itertools import takewhile, dropwhile
 
 from twisted.internet.defer import Deferred
 from twisted.internet.task import Clock
@@ -61,7 +62,7 @@ class FakeRedis(object):
     def _clean_up_expires(self):
         for key in self._expiries.keys():
             delayed = self._expiries.pop(key)
-            if not delayed.cancelled:
+            if not (delayed.cancelled or delayed.called):
                 delayed.cancel()
 
     # Global operations
@@ -131,6 +132,15 @@ class FakeRedis(object):
         self.set.sync(self, key, new_value)
         return new_value
 
+    @maybe_async
+    def decr(self, key, amount=1):
+        old_value = self._data.get(key)
+        if old_value is None:
+            old_value = 0
+        new_value = int(old_value) - amount
+        self.set.sync(self, key, new_value)
+        return new_value
+
     # Hash operations
 
     @maybe_async
@@ -139,6 +149,12 @@ class FakeRedis(object):
         new_field = field not in mapping
         mapping[field] = value
         return int(new_field)
+
+    @maybe_async
+    def hsetnx(self, key, field, value):
+        if self.hexists.sync(self, key, field):
+            return 0
+        return self.hset.sync(self, key, field, value)
 
     @maybe_async
     def hget(self, key, field):
@@ -194,7 +210,9 @@ class FakeRedis(object):
     @maybe_async
     def sadd(self, key, *values):
         sval = self._data.setdefault(key, set())
+        old_len = len(sval)
         sval.update(map(self._encode, values))
+        return len(sval) - old_len
 
     @maybe_async
     def smembers(self, key):
@@ -266,6 +284,26 @@ class FakeRedis(object):
         else:
             return [v for v, k in results]
 
+    @maybe_async
+    def zrangebyscore(self, key, min='-inf', max='+inf', start=0, num=None,
+                withscores=False, score_cast_func=float):
+        zval = self._data.get(key, Zset())
+        results = zval.zrangebyscore(min, max, start, num,
+                              score_cast_func=score_cast_func)
+        if withscores:
+            return results
+        else:
+            return [v for v, k in results]
+
+    @maybe_async
+    def zcount(self, key, min, max):
+        return str(len(self.zrangebyscore.sync(self, key, min, max)))
+
+    @maybe_async
+    def zscore(self, key, value):
+        zval = self._data.get(key, Zset())
+        return zval.zscore(value)
+
     # List operations
     @maybe_async
     def llen(self, key):
@@ -275,6 +313,11 @@ class FakeRedis(object):
     def lpop(self, key):
         if self.llen.sync(self, key):
             return self._data[key].pop(0)
+
+    @maybe_async
+    def rpop(self, key):
+        if self.llen.sync(self, key):
+            return self._data[key].pop(-1)
 
     @maybe_async
     def lpush(self, key, obj):
@@ -314,6 +357,19 @@ class FakeRedis(object):
         self._data[key] = lval
         return removed[0]
 
+    @maybe_async
+    def rpoplpush(self, source, destination):
+        value = self.rpop.sync(self, source)
+        if value:
+            self.lpush.sync(self, destination, value)
+            return value
+
+    @maybe_async
+    def ltrim(self, key, start, stop):
+        lval = self._data.get(key, [])
+        del lval[:start]
+        del lval[stop:]
+
     # Expiry operations
 
     @maybe_async
@@ -349,7 +405,8 @@ class Zset(object):
 
     def zadd(self, **valscores):
         new_zval = [val for val in self._zval if val[1] not in valscores]
-        new_zval.extend((score, value) for value, score in valscores.items())
+        new_zval.extend((float(score), value) for value, score
+                            in valscores.items())
         new_zval.sort()
         added = len(new_zval) - len(self._zval)
         self._zval = new_zval
@@ -368,7 +425,46 @@ class Zset(object):
         stop += 1  # redis start/stop are element indexes
         if stop == 0:
             stop = None
-        results = [(score_cast_func(k), v) for k, v in self._zval[start:stop]]
-        if desc:
-            results.reverse()
-        return [(v, k) for k, v in results]
+
+        # copy before changing in place
+        zval = self._zval[:]
+        zval.sort(reverse=desc)
+
+        return [(v, score_cast_func(k)) for k, v in zval[start:stop]]
+
+    def zrangebyscore(self, min='-inf', max='+inf', start=0, num=None,
+        score_cast_func=float):
+        results = self.zrange(0, -1, score_cast_func=score_cast_func)
+        results.sort(key=lambda val: val[1])
+
+        def mkcheck(spec, is_upper_bound):
+            spec = str(spec)
+            # Handling infinities are easy, so get them out the way first.
+            if spec.endswith('-inf'):
+                return lambda val: False
+            if spec.endswith('+inf'):
+                return lambda val: True
+
+            is_exclusive = False
+            if spec.startswith('('):
+                is_exclusive = True
+                spec = spec[1:]
+            spec = score_cast_func(spec)
+
+            # For the lower bound, exclusive means drop less than or equal to.
+            # For the upper bound, exclusive means take less than.
+            if is_exclusive == is_upper_bound:
+                return lambda val: val[1] < spec
+            return lambda val: val[1] <= spec
+
+        results = dropwhile(mkcheck(min, False), results)
+        results = takewhile(mkcheck(max, True), results)
+        results = list(results)[start:]
+        if num is not None:
+            results = results[:num]
+        return list(results)
+
+    def zscore(self, val):
+        for score, value in self._zval:
+            if value == val:
+                return score

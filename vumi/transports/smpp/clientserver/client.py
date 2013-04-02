@@ -262,11 +262,13 @@ class EsmeTransceiver(Protocol):
 
         Particularly problematic are the "Octet unspecified" encodings.
         """
-        codec = dict({
+        codecs = {
             1: 'ascii',
             3: 'latin1',
             8: 'utf-16be',  # Actually UCS-2, but close enough.
-            }, **self.config.data_coding_overrides).get(data_coding, None)
+            }
+        codecs.update(self.config.data_coding_overrides)
+        codec = codecs.get(data_coding, None)
         if codec is None or message is None:
             log.msg("WARNING: Not decoding message with data_coding=%s" % (
                     data_coding,))
@@ -392,11 +394,15 @@ class EsmeTransceiver(Protocol):
         if completed:
             yield self.redis.delete(redis_key)
             log.msg("Reassembled Message: %s" % (completed['message']))
+            # We assume that all parts have the same data_coding here, because
+            # otherwise there's nothing sensible we can do.
+            decoded_msg = self._decode_message(completed['message'],
+                                               pdu_params['data_coding'])
             # and we can finally pass the whole message on
             yield self.esme_callbacks.deliver_sm(
                 destination_addr=completed['to_msisdn'],
                 source_addr=completed['from_msisdn'],
-                short_message=completed['message'],
+                short_message=decoded_msg,
                 message_id=message_id,
                 )
         else:
