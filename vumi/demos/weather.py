@@ -70,7 +70,7 @@ class WeatherApp(object):
 
     @classmethod
     def from_state(cls, state):
-        return cls(name=state.pop('name'), lat=state.pop('lat'), lng=state.pop('lng'), config=state)
+        return cls(name=state['name'], lat=state['lat'], lng=state['lng'], config=state)
 
     @property
     def has_location(self):
@@ -82,15 +82,16 @@ class WeatherApp(object):
             return self.UI_TEMPLATE % {
                 "location": self.name,
                 "weather": self.render_forecast(),
-                "prompt": "Enter a new location or 0 to quit"
+                "prompt": u"Enter a new location\nor 0 to quit"
             }
         else:
-            return self.msg or "Enter your location"
+            return self.msg or u"Enter your location"
 
     def render_forecast(self):
         output = ""
         for date in sorted(self.forecast.iterkeys()):
-            output += date + ": %(min)s - %(max)s\n" % self.forecast[date]
+            real_date = datetime.strptime(date, "%Y-%m-%d")
+            output += real_date.strftime("%a %d %b") + ": %(min)s - %(max)s\n" % self.forecast[date]
         return output
 
     @inlineCallbacks
