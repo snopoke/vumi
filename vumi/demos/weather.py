@@ -141,7 +141,6 @@ class WeatherApp(object):
         query = {"lat": self.lat, "lon": self.lng}
         url = self.config[WEATHER_SLUG] % (urllib.urlencode(query),)
         data = yield http_request(url, None, method="GET")
-
         self.parse_weather_data(data)
 
     def parse_weather_data(self, data):
