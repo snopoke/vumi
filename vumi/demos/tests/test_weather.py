@@ -30,7 +30,7 @@ class TestWeatherApp(unittest.TestCase, WebserverMixin):
     @inlineCallbacks
     def setUp(self):
         yield self.setupWebserver()
-        self.config = {USERNAME_SLUG: "dimagi", WEATHER_SLUG: self.weather_url + "?%s",
+        self.config = {USERNAME_SLUG: "username", WEATHER_SLUG: self.weather_url + "?%s",
                        LOCATION_SLUG: self.location_url + "?%s"}
         self.app = WeatherApp(config=self.config)
 
@@ -93,7 +93,7 @@ class TestWeatherWorker(ApplicationTestCase, WebserverMixin):
         super(TestWeatherWorker, self).setUp()
         yield self.setupWebserver()
 
-        self.worker = yield self.get_application({USERNAME_SLUG: "dimagi",
+        self.worker = yield self.get_application({USERNAME_SLUG: "username",
                                                   WEATHER_SLUG: self.weather_url + "?%s",
                                                   LOCATION_SLUG: self.location_url + "?%s"})
         yield self.worker.session_manager.redis._purge_all()  # just in case
